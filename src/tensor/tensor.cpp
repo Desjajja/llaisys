@@ -5,6 +5,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <cstddef>
 
 namespace llaisys {
 
@@ -164,27 +165,87 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    const auto& shape = this->shape();
+    const auto& strides = this->strides();
+    size_t ndim = shape.size();
+    if (ndim == 0) return true;
+
+    size_t expected_stride = 1;
+    for (size_t i = ndim; i-- > 0;) {
+        if (strides[i] != static_cast<ptrdiff_t>(expected_stride)) {
+            return false;
+        }
+        expected_stride *= shape[i];
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (order.size() != this->ndim()) {
+        throw std::runtime_error("permute: order size must match ndim");
+    }
+    std::vector<bool> seen(order.size(), false);
+    for (size_t i : order) {
+        if (i >= order.size() || seen[i]) {
+            throw std::runtime_error("permute: invalid order");
+        }
+        seen[i] = true;
+    }
+    std::vector<size_t> new_shape(order.size());
+    std::vector<ptrdiff_t> new_strides(order.size());
+    for (int i = 0; i < order.size(); ++i) {
+        new_shape[i] = this->shape()[order[i]];
+        new_strides[i] = this->strides()[order[i]];
+    }
+    auto _meta_new = _meta;
+    _meta_new.shape = std::move(new_shape);
+    _meta_new.strides = std::move(new_strides);
+    return std::shared_ptr<Tensor>(new Tensor(_meta_new, _storage));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (!this->isContiguous()) 
+        throw std::runtime_error("Tensor::view: storage must be contiguous");
+    auto _meta_new = this->_meta;
+
+    std::vector<ptrdiff_t> strides(shape.size());
+    size_t stride = 1;
+    for (size_t i = shape.size(); i-- > 0;) {
+        strides[i] = stride;
+        stride *= shape[i];
+    }
+
+    _meta_new.shape = shape;
+    _meta_new.strides = strides;
+    return std::shared_ptr<Tensor>(new Tensor(_meta_new, this->_storage));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    auto new_shape = _meta.shape;
+    // auto new_strides = _meta.strides;
+    auto _meta_new = _meta;
+    
+    new_shape[dim] = end - start;
+    size_t offset = _meta.strides[dim] * start * elementSize();
+
+    _meta_new.shape = std::move(new_shape);
+    // _meta_new.strides = std::move(new_strides);
+    return std::shared_ptr<Tensor>(new Tensor(_meta_new, _storage, _offset + offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    // number of bytes to copy
+    size_t bytes = this->numel() * this->elementSize();
+    std::byte *dst = this->data();
+
+    if (this->deviceType() == LLAISYS_DEVICE_CPU) {
+        std::memcpy(dst, src_, bytes);
+    } else {
+        core::context().setDevice(this->deviceType(), this->deviceId());
+        core::context().runtime().api()->memcpy_sync(
+            dst, src_, bytes, LLAISYS_MEMCPY_H2D
+        );
+    }
 }
 
 tensor_t Tensor::contiguous() const {
