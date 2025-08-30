@@ -1,175 +1,95 @@
 #include "op.hpp"
-
-#include <cstdint>
-#include <cstring>
-#include <cmath>
-#include <limits>
+#include "../../utils/types.hpp"
 
 namespace llaisys::ops {
 
-// convert half (IEEE 754 binary16 stored in uint16_t) to float
-static inline float half_to_float(uint16_t h) {
-    const uint32_t sign = (h >> 15) & 0x1;
-    const uint32_t exp  = (h >> 10) & 0x1F;
-    const uint32_t mant = h & 0x3FF;
+using namespace llaisys::utils;
 
-    if (exp == 0) {
-        if (mant == 0) {
-            return sign ? -0.0f : 0.0f;
-        } else {
-            // subnormal
-            float m = mant / 1024.0f; // mantissa / 2^10
-            float val = std::ldexp(m, -14); // m * 2^-14
-            return sign ? -val : val;
-        }
-    } else if (exp == 31) {
-        if (mant == 0) {
-            return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
-        } else {
-            return std::numeric_limits<float>::quiet_NaN();
-        }
-    } else {
-        float m = 1.0f + (mant / 1024.0f);
-        float val = std::ldexp(m, static_cast<int>(exp) - 15);
-        return sign ? -val : val;
-    }
-}
+template <typename T>
+struct ArgmaxAdapter {
+    static inline float to_float(T v) { return static_cast<float>(v); }
+    static inline T from_float(float v) { return static_cast<T>(v); }
+};
 
-// convert float to half (IEEE 754 binary16 packed into uint16_t)
-// simple implementation with rounding-to-nearest-even approximation
-static inline uint16_t float_to_half(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, sizeof(x));
-    uint32_t sign = (x >> 16) & 0x8000u;
-    int32_t exp = ((x >> 23) & 0xFF) - 127;
-    uint32_t mant = x & 0x7FFFFFu;
+template <>
+struct ArgmaxAdapter<fp16_t> {
+    static inline float to_float(fp16_t v) { return _f16_to_f32(v); }
+    static inline fp16_t from_float(float v) { return _f32_to_f16(v); }
+};
 
-    if (((x >> 23) & 0xFF) == 0xFF) { // NaN or Inf
-        if (mant == 0) { // Inf
-            return static_cast<uint16_t>(sign | 0x7C00u);
-        } else { // NaN
-            return static_cast<uint16_t>(sign | 0x7E00u);
+template <>
+struct ArgmaxAdapter<bf16_t> {
+    static inline float to_float(bf16_t v) { return _bf16_to_f32(v); }
+    static inline bf16_t from_float(float v) { return _f32_to_bf16(v); }
+};
+
+template <typename T>
+void argmax_impl(tensor_t max_idx, tensor_t max_val, const T* data, size_t n) {
+    float max_f = ArgmaxAdapter<T>::to_float(data[0]);
+    size_t idx = 0;
+    for (size_t i = 1; i < n; ++i) {
+        float v = ArgmaxAdapter<T>::to_float(data[i]);
+        if (v > max_f) {
+            max_f = v;
+            idx = i;
         }
     }
-
-    int32_t newexp = exp + 15;
-    if (newexp >= 0x1F) { // overflow -> Inf
-        return static_cast<uint16_t>(sign | 0x7C00u);
-    } else if (newexp <= 0) {
-        // subnormal or underflow to zero
-        if (newexp < -10) {
-            return static_cast<uint16_t>(sign); // zero
-        }
-        // create subnormal half
-        mant = mant | 0x800000u; // add implicit 1
-        int shift = 14 - newexp;
-        uint32_t half_mant = mant >> (shift + 13); // mant >> (shift + (23-10))
-        // rounding: check bit just below cutoff
-        uint32_t rem = (mant >> (shift + 12)) & 1u;
-        half_mant += rem;
-        return static_cast<uint16_t>(sign | half_mant);
-    } else {
-        uint16_t half = static_cast<uint16_t>(sign | (static_cast<uint16_t>(newexp) << 10) | static_cast<uint16_t>(mant >> 13));
-        // rounding: check bit 12 of mant (the highest dropped bit)
-        if (mant & 0x00001000u) {
-            half++; // simple round
-        }
-        return half;
-    }
-}
-
-// convert bfloat16 (stored as uint16_t) to float32
-static inline float bf16_to_float(uint16_t b) {
-    uint32_t x = static_cast<uint32_t>(b) << 16;
-    float f;
-    std::memcpy(&f, &x, sizeof(f));
-    return f;
-}
-
-// convert float32 to bfloat16 (uint16_t) with simple round-to-nearest
-static inline uint16_t float_to_bf16(float f) {
-    uint32_t x;
-    std::memcpy(&x, &f, sizeof(x));
-    // round to nearest even: add 0x8000 then shift
-    uint32_t rounding = 0x8000u;
-    uint16_t b = static_cast<uint16_t>((x + rounding) >> 16);
-    return b;
+    *reinterpret_cast<int64_t*>(max_idx->data()) = static_cast<int64_t>(idx);
+    *reinterpret_cast<T*>(max_val->data()) = ArgmaxAdapter<T>::from_float(max_f);
 }
 
 void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
     size_t n = vals->numel();
-    if (n == 0) {
-        throw std::runtime_error("argmax: empty tensor");
-    }
+    if (n == 0) throw std::runtime_error("argmax: empty tensor");
 
     switch (vals->dtype()) {
-        case LLAISYS_DTYPE_F32: {
-            auto vals_data = reinterpret_cast<const float*>(vals->data());
-            float max_value = vals_data[0];
-            size_t max_index = 0;
-            for (size_t i = 1; i < n; ++i) {
-                if (vals_data[i] > max_value) {
-                    max_value = vals_data[i];
-                    max_index = i;
-                }
-            }
-            *reinterpret_cast<int64_t*>(max_idx->data()) = static_cast<int64_t>(max_index);
-            *reinterpret_cast<float*>(max_val->data()) = max_value;
+        case LLAISYS_DTYPE_F32:
+            argmax_impl<float>(max_idx, max_val,
+                               reinterpret_cast<const float*>(vals->data()), n);
             break;
-        }
-
-        case LLAISYS_DTYPE_I32: {
-            auto vals_data = reinterpret_cast<const int32_t*>(vals->data());
-            int32_t max_value = vals_data[0];
-            size_t max_index = 0;
-            for (size_t i = 1; i < n; ++i) {
-                if (vals_data[i] > max_value) {
-                    max_value = vals_data[i];
-                    max_index = i;
-                }
-            }
-            *reinterpret_cast<int64_t*>(max_idx->data()) = static_cast<int64_t>(max_index);
-            *reinterpret_cast<int32_t*>(max_val->data()) = max_value;
+        case LLAISYS_DTYPE_I32:
+            argmax_impl<int32_t>(max_idx, max_val,
+                                 reinterpret_cast<const int32_t*>(vals->data()), n);
             break;
-        }
-
-        case LLAISYS_DTYPE_F16: {
-            auto vals_data = reinterpret_cast<const uint16_t*>(vals->data());
-            float max_value_f = half_to_float(vals_data[0]);
-            size_t max_index = 0;
-            for (size_t i = 1; i < n; ++i) {
-                float v = half_to_float(vals_data[i]);
-                if (v > max_value_f) {
-                    max_value_f = v;
-                    max_index = i;
-                }
-            }
-            *reinterpret_cast<int64_t*>(max_idx->data()) = static_cast<int64_t>(max_index);
-            uint16_t out = float_to_half(max_value_f);
-            *reinterpret_cast<uint16_t*>(max_val->data()) = out;
+        case LLAISYS_DTYPE_I8:
+            argmax_impl<int8_t>(max_idx, max_val,
+                                reinterpret_cast<const int8_t*>(vals->data()), n);
             break;
-        }
-
-        case LLAISYS_DTYPE_BF16: {
-            auto vals_data = reinterpret_cast<const uint16_t*>(vals->data());
-            float max_value_f = bf16_to_float(vals_data[0]);
-            size_t max_index = 0;
-            for (size_t i = 1; i < n; ++i) {
-                float v = bf16_to_float(vals_data[i]);
-                if (v > max_value_f) {
-                    max_value_f = v;
-                    max_index = i;
-                }
-            }
-            *reinterpret_cast<int64_t*>(max_idx->data()) = static_cast<int64_t>(max_index);
-            uint16_t out = float_to_bf16(max_value_f);
-            *reinterpret_cast<uint16_t*>(max_val->data()) = out;
+        case LLAISYS_DTYPE_I16:
+            argmax_impl<int16_t>(max_idx, max_val,
+                                 reinterpret_cast<const int16_t*>(vals->data()), n);
             break;
-        }
-
+        case LLAISYS_DTYPE_I64:
+            argmax_impl<int64_t>(max_idx, max_val,
+                                 reinterpret_cast<const int64_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_U8:
+            argmax_impl<uint8_t>(max_idx, max_val,
+                                 reinterpret_cast<const uint8_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_U16:
+            argmax_impl<uint16_t>(max_idx, max_val,
+                                  reinterpret_cast<const uint16_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_U32:
+            argmax_impl<uint32_t>(max_idx, max_val,
+                                  reinterpret_cast<const uint32_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_U64:
+            argmax_impl<uint64_t>(max_idx, max_val,
+                                  reinterpret_cast<const uint64_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_F16:
+            argmax_impl<fp16_t>(max_idx, max_val,
+                                reinterpret_cast<const fp16_t*>(vals->data()), n);
+            break;
+        case LLAISYS_DTYPE_BF16:
+            argmax_impl<bf16_t>(max_idx, max_val,
+                                reinterpret_cast<const bf16_t*>(vals->data()), n);
+            break;
         default:
             throw std::runtime_error("argmax: unsupported dtype");
     }
 }
 
-}
+} //
